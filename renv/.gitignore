@@ -5,4 +5,4 @@ lock/
 python/
 sandbox/
 staging/
-data/
+../data/
