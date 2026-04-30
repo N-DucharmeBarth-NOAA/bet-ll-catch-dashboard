@@ -97,6 +97,14 @@ ui <- fluidPage(
                    choices = c("Proportion (%)" = "proportion", "Nominal" = "nominal"),
                    selected = "proportion", inline = TRUE),
       pickerInput(
+        inputId  = "sel_metrics",
+        label    = "Data to show:",
+        choices  = c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"),
+        selected = c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"),
+        multiple = TRUE,
+        options  = list(`actions-box` = TRUE)
+      ),
+      pickerInput(
         inputId  = "sel_flags",
         label    = "Flags:",
         choices  = flag_choices,
@@ -171,6 +179,8 @@ server <- function(input, output, session) {
   long_data <- reactive({
     validate(need(length(input$sel_flags) > 0,
                   "No flags selected \u2014 use the Flags selector to include at least one flag."))
+    validate(need(length(input$sel_metrics) > 0,
+                  "No data selected \u2014 use the Data to show selector to include at least one metric."))
     d <- filtered()
     validate(need(nrow(d) > 0, "No data in selected year range."))
 
@@ -209,6 +219,9 @@ server <- function(input, output, session) {
     long[, variable := factor(variable, levels = 1:3,
                               labels = c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"))]
     setnames(long, "variable", "metric")
+
+    # Filter to only selected metrics
+    long <- long[as.character(metric) %in% input$sel_metrics]
 
     # Apply group-based ordering of flags (controls stacking + legend order)
     long[, flag_code := factor(flag_code, levels = flag_levels)]
@@ -357,7 +370,7 @@ server <- function(input, output, session) {
 
     # Dcast: one row per flag, columns = metric × zone combos
     col_order <- as.vector(outer(
-      c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"),
+      intersect(c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"), input$sel_metrics),
       c("Southern LL", "Tropical LL", "Northern LL"),
       FUN = function(m, z) paste0(m, " | ", z)
     ))
