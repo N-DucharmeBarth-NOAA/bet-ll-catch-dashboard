@@ -14,12 +14,13 @@ dt       <- fread(csv_path)
 ccodes   <- fread(country_path)
 
 # Convert LAT5/LON5 to numeric centroids on a 0-360 longitude convention
+# Strip direction suffix first so fifelse evaluates clean numerics in both branches
+dt[, lon_num := as.numeric(sub("[EW]$", "", LON5))]
 dt[, `:=`(
   lat = (as.numeric(sub("[NS]$", "", LAT5)) * fifelse(grepl("S$", LAT5), -1, 1)) + 2.5,
-  lon = fifelse(grepl("E$", LON5),
-                as.numeric(sub("E$", "", LON5)),
-                360 - as.numeric(sub("W$", "", LON5))) + 2.5
+  lon = fifelse(grepl("E$", LON5), lon_num, 360 - lon_num) + 2.5
 )]
+dt[, lon_num := NULL]
 
 # Filter out records with empty flag_code
 dt <- dt[flag_code != ""]
@@ -112,10 +113,19 @@ ui <- fluidPage(
       )
     ),
     mainPanel(
-      uiOutput("plot_caption"),
-      DT::DTOutput("band_summary"),
-      tags$br(),
-      plotlyOutput("prop_plot", height = "750px")
+      tabsetPanel(
+        tabPanel("Summary plot",
+          tags$br(),
+          uiOutput("plot_caption"),
+          DT::DTOutput("band_summary"),
+          tags$br(),
+          plotlyOutput("prop_plot", height = "750px")
+        ),
+        tabPanel("Summary data",
+          tags$br(),
+          DT::DTOutput("flag_data_table")
+        )
+      )
     )
   )
 )
@@ -333,6 +343,106 @@ server <- function(input, output, session) {
 
     ggplotly(p, tooltip = "text")
   })
+  # ---- Data tab: flag-level wide table ------------------------------------
+  flag_table_dat <- reactive({
+    long    <- long_data()
+    mode    <- input$display_mode
+    val_col <- if (mode == "proportion") "proportion" else "raw_value"
+
+    # Keep only the columns we need and rename value col generically
+    d <- long[, .(flag_code, lat_band, metric, value = get(val_col))]
+
+    # Build combined column name: "metric | zone"
+    d[, col_name := paste0(as.character(metric), " | ", as.character(lat_band))]
+
+    # Dcast: one row per flag, columns = metric × zone combos
+    col_order <- as.vector(outer(
+      c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"),
+      c("Southern LL", "Tropical LL", "Northern LL"),
+      FUN = function(m, z) paste0(m, " | ", z)
+    ))
+
+    wide <- dcast(d, flag_code ~ col_name, value.var = "value", fill = 0)
+
+    # Add missing columns (in case some combos don't exist)
+    for (cn in col_order) {
+      if (!cn %in% names(wide)) wide[[cn]] <- 0
+    }
+    setcolorder(wide, c("flag_code", intersect(col_order, names(wide))))
+
+    # Replace flag_code with full labels
+    wide[, Flag := flag_labels[as.character(flag_code)]]
+    wide[, flag_code := NULL]
+    setcolorder(wide, c("Flag", intersect(col_order, names(wide))))
+
+    # Scale proportions to percent
+    val_cols <- intersect(col_order, names(wide))
+    if (mode == "proportion") {
+      wide[, (val_cols) := lapply(.SD, function(x) x * 100), .SDcols = val_cols]
+    }
+
+    as.data.frame(wide)
+  })
+
+  output$flag_data_table <- DT::renderDT({
+    dat <- flag_table_dat()
+
+    lo <- input$lat_band[1]; hi <- input$lat_band[2]
+    lo_lab <- if (lo < 0) sprintf("%d\u00B0S", abs(lo)) else sprintf("%d\u00B0N", lo)
+    hi_lab <- if (hi < 0) sprintf("%d\u00B0S", abs(hi)) else sprintf("%d\u00B0N", hi)
+
+    flag_note <- if (setequal(input$sel_flags, flag_levels)) {
+      "All flags"
+    } else {
+      paste0("flags: ", paste(sort(input$sel_flags), collapse = ", "))
+    }
+
+    cap <- if (input$display_mode == "proportion") {
+      paste0("Proportion of total by flag and management band (%) \u2014 Years: ",
+             input$year_range[1], "\u2013", input$year_range[2],
+             " | Tropical LL: ", lo_lab, " to ", hi_lab,
+             " | ", flag_note)
+    } else {
+      paste0("Nominal values by flag and management band \u2014 Years: ",
+             input$year_range[1], "\u2013", input$year_range[2],
+             " | Tropical LL: ", lo_lab, " to ", hi_lab,
+             " | ", flag_note)
+    }
+
+    val_cols <- setdiff(names(dat), "Flag")
+
+    DT::datatable(
+      dat,
+      extensions = "Buttons",
+      caption    = cap,
+      rownames   = FALSE,
+      options    = list(
+        dom        = "Bfrtip",
+        buttons    = list(
+          list(extend = "copy",  text = "Copy",  title = "WCPFC LL flag data"),
+          list(extend = "csv",   text = "CSV",   filename = "wcpfc_ll_flag_data"),
+          list(extend = "excel", text = "Excel", filename = "wcpfc_ll_flag_data",
+               title = "WCPFC LL flag data"),
+          list(extend = "pdf",   text = "PDF",   filename = "wcpfc_ll_flag_data",
+               title = "WCPFC LL flag data",
+               orientation = "landscape")
+        ),
+        pageLength = 20,
+        ordering   = TRUE,
+        searching  = TRUE,
+        info       = TRUE,
+        scrollX    = TRUE
+      ),
+      class = "stripe hover compact"
+    ) |>
+      (\(tbl) if (input$display_mode == "nominal")
+        DT::formatCurrency(tbl, columns = val_cols, currency = "", digits = 0)
+      else
+        DT::formatRound(tbl, columns = val_cols, digits = 2)
+      )() |>
+      DT::formatStyle(val_cols, `text-align` = "right")
+  }, server = FALSE)
+
 }
 
 # ---- Run -----------------------------------------------------------------
