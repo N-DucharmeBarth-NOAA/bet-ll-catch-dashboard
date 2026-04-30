@@ -3,6 +3,7 @@ library(data.table)
 library(ggplot2)
 library(plotly)
 library(DT)
+library(RColorBrewer)
 
 # ---- Data load & preprocessing -------------------------------------------
 csv_path <- file.path(".","data","WCPFC_L_PUBLIC_BY_YY_FLAG.csv")
@@ -23,9 +24,16 @@ dt <- dt[flag_code != ""]
 # Reassign US flag_code south of the equator to AS (American Samoa)
 dt[flag_code == "US" & lat < 0, flag_code := "AS"]
 
+# Active flags: only those with at least one non-zero effort or catch record
+active_flags <- sort(unique(dt[HHOOKS > 0 | BET_C > 0 | BET_N > 0, flag_code]))
+
+# Fixed color palette mapped to flag codes (stable across selections)
+flag_pal <- colorRampPalette(RColorBrewer::brewer.pal(12, "Paired"))(length(active_flags))
+names(flag_pal) <- active_flags
+
 # ---- UI ------------------------------------------------------------------
 ui <- fluidPage(
-  titlePanel("WCPFC Longline: Effort & Bigeye Catch by Management Band"),
+  titlePanel("WCPFC Longline: Effort & Bigeye Catch by Management Zone"),
   sidebarLayout(
     sidebarPanel(
       sliderInput("year_range",
@@ -42,7 +50,24 @@ ui <- fluidPage(
               "Southern LL is south of the lower bound; Northern LL is north of the upper bound."),
       radioButtons("display_mode", "Display values as:",
                    choices = c("Proportion (%)" = "proportion", "Nominal" = "nominal"),
-                   selected = "proportion", inline = TRUE)
+                   selected = "proportion", inline = TRUE),
+      selectInput("sel_flags", "Flags:",
+                  choices  = active_flags,
+                  selected = active_flags,
+                  multiple = TRUE,
+                  selectize = TRUE),
+      div(
+        style = "margin-bottom: 10px;",
+        actionButton("btn_all",  "Select all",   class = "btn btn-xs btn-default"),
+        actionButton("btn_none", "Deselect all", class = "btn btn-xs btn-default")
+      ),
+      conditionalPanel(
+        condition = "input.display_mode === 'proportion'",
+        radioButtons("prop_basis", "Proportion relative to:",
+                     choices = c("Selected flags only" = "selected",
+                                 "All flags (grand total)" = "grand"),
+                     selected = "selected")
+      )
     ),
     mainPanel(
       uiOutput("plot_caption"),
@@ -70,10 +95,30 @@ server <- function(input, output, session) {
 
     d[, lat_band := factor(lat_band,
                            levels = c("Southern LL", "Tropical LL", "Northern LL"))]
+    d <- d[flag_code %in% input$sel_flags]
     d
   })
 
+  # Aggregation over ALL active flags for the current year/lat slice (grand-total denominator)
+  all_flags_agg <- reactive({
+    lo <- input$lat_band[1]
+    hi <- input$lat_band[2]
+    d <- dt[YY >= input$year_range[1] & YY <= input$year_range[2] &
+              flag_code %in% active_flags]
+    d[, lat_band := fcase(
+      lat <  lo,             "Southern LL",
+      lat >= lo & lat <= hi, "Tropical LL",
+      lat >  hi,             "Northern LL"
+    )]
+    d[, .(HHOOKS = sum(HHOOKS, na.rm = TRUE),
+          BET_C  = sum(BET_C,  na.rm = TRUE),
+          BET_N  = sum(BET_N,  na.rm = TRUE)),
+      by = .(lat_band, flag_code)]
+  })
+
   long_data <- reactive({
+    validate(need(length(input$sel_flags) > 0,
+                  "No flags selected \u2014 use the Flags selector to include at least one flag."))
     d <- filtered()
     validate(need(nrow(d) > 0, "No data in selected year range."))
 
@@ -83,7 +128,17 @@ server <- function(input, output, session) {
       BET_N  = sum(BET_N,  na.rm = TRUE)
     ), by = .(lat_band, flag_code)]
 
-    tot_h <- sum(agg$HHOOKS); tot_c <- sum(agg$BET_C); tot_n <- sum(agg$BET_N)
+    # Ensure every flag × band combination exists (fill absent cells with 0)
+    full_grid <- CJ(
+      lat_band  = factor(c("Southern LL", "Tropical LL", "Northern LL"),
+                         levels = c("Southern LL", "Tropical LL", "Northern LL")),
+      flag_code = input$sel_flags
+    )
+    agg <- agg[full_grid, on = .(lat_band, flag_code)]
+    agg[is.na(HHOOKS), `:=`(HHOOKS = 0L, BET_C = 0, BET_N = 0)]
+
+    tot_base <- if (isTRUE(input$prop_basis == "grand")) all_flags_agg() else agg
+    tot_h <- sum(tot_base$HHOOKS); tot_c <- sum(tot_base$BET_C); tot_n <- sum(tot_base$BET_N)
     agg[, `:=`(
       p_HHOOKS = if (tot_h > 0) HHOOKS / tot_h else 0,
       p_BET_C  = if (tot_c > 0) BET_C  / tot_c else 0,
@@ -121,6 +176,14 @@ server <- function(input, output, session) {
     as.data.frame(wide)
   })
 
+  observeEvent(input$btn_all, {
+    updateSelectInput(session, "sel_flags", selected = active_flags)
+  })
+
+  observeEvent(input$btn_none, {
+    updateSelectInput(session, "sel_flags", selected = character(0))
+  })
+
   output$plot_caption <- renderUI({
     lo <- input$lat_band[1]; hi <- input$lat_band[2]
     lo_lab <- if (lo < 0) sprintf("%d\u00B0S", abs(lo)) else sprintf("%d\u00B0N", lo)
@@ -139,14 +202,22 @@ server <- function(input, output, session) {
     lo_lab <- if (lo < 0) sprintf("%d\u00B0S", abs(lo)) else sprintf("%d\u00B0N", lo)
     hi_lab <- if (hi < 0) sprintf("%d\u00B0S", abs(hi)) else sprintf("%d\u00B0N", hi)
 
+    flag_note <- if (setequal(input$sel_flags, active_flags)) {
+      "All flags"
+    } else {
+      paste0("flags: ", paste(sort(input$sel_flags), collapse = ", "))
+    }
+
     cap <- if (input$display_mode == "proportion") {
       paste0("Proportion of total by management band (%) \u2014 Years: ",
              input$year_range[1], "\u2013", input$year_range[2],
-             " | Tropical LL: ", lo_lab, " to ", hi_lab)
+             " | Tropical LL: ", lo_lab, " to ", hi_lab,
+             " | ", flag_note)
     } else {
       paste0("Nominal values by management band \u2014 Years: ",
              input$year_range[1], "\u2013", input$year_range[2],
-             " | Tropical LL: ", lo_lab, " to ", hi_lab)
+             " | Tropical LL: ", lo_lab, " to ", hi_lab,
+             " | ", flag_note)
     }
 
     val_cols <- intersect(c("Southern LL", "Tropical LL", "Northern LL"), names(dat))
@@ -176,7 +247,7 @@ server <- function(input, output, session) {
       class = "stripe hover compact"
     ) |>
       DT::formatRound(columns = val_cols,
-                      digits  = if (input$display_mode == "proportion") 1 else 0,
+                      digits  = if (input$display_mode == "proportion") 2 else 0,
                       mark    = if (input$display_mode == "nominal") "," else "") |>
       DT::formatStyle(val_cols, `text-align` = "right")
   }, server = FALSE)
@@ -195,6 +266,7 @@ server <- function(input, output, session) {
           facet_wrap(~ metric, ncol = 1) +
           scale_y_continuous(labels = scales::percent_format(accuracy = 1),
                              limits = c(0, 1), expand = c(0, 0)) +
+          scale_fill_manual(values = flag_pal) +
           labs(x = NULL, y = "Proportion of total", fill = "Flag") +
           theme_bw(base_size = 13) +
           theme(strip.text = element_text(face = "bold"))
@@ -208,6 +280,7 @@ server <- function(input, output, session) {
           ))) +
           facet_wrap(~ metric, ncol = 1, scales = "free_y") +
           scale_y_continuous(labels = scales::comma_format(), expand = c(0, 0)) +
+          scale_fill_manual(values = flag_pal) +
           labs(x = NULL, y = "Value", fill = "Flag") +
           theme_bw(base_size = 13) +
           theme(strip.text = element_text(face = "bold"))
