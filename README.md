@@ -1,0 +1,32 @@
+# bet-ll-catch-dashboard
+
+An R Shiny dashboard for exploring WCPFC (Western and Central Pacific Fisheries Commission) public longline catch and effort data, with a focus on bigeye tuna (BET).
+
+## Overview
+
+The app loads WCPFC public longline data and lets users interactively examine how fishing effort and bigeye tuna catch (by weight and numbers) are distributed across three user-defined latitude management bands — Northern LL, Tropical LL, and Southern LL — broken down by flag state. Key controls include:
+
+- **Year range** slider to filter the time period of interest
+- **Latitude band** slider to define the boundaries of the Tropical LL zone
+
+Results are displayed as stacked bar charts faceted by metric (effort, catch weight, catch numbers).
+
+## Requirements
+
+- R (≥ 4.0)
+- Packages: `shiny`, `data.table`, `ggplot2`
+- WCPFC public longline CSV (`WCPFC_L_PUBLIC_BY_YY_FLAG.csv`)
+
+## Usage
+
+```r
+shiny::runApp("app.r")
+```
+
+## License
+
+The code contained in this repository is licensed under the GNU GENERAL PUBLIC LICENSE version 3 ([GPLv3](https://www.gnu.org/licenses/gpl-3.0.html)).
+
+## Disclaimer
+
+This repository is a scientific product and is not official communication of the National Oceanic and Atmospheric Administration, or the United States Department of Commerce. All NOAA GitHub project code is provided on an ‘as is’ basis and the user assumes responsibility for its use. Any claims against the Department of Commerce or Department of Commerce bureaus stemming from the use of this GitHub project will be governed by all applicable Federal law. Any reference to specific commercial products, processes, or services by service mark, trademark, manufacturer, or otherwise, does not constitute or imply their endorsement, recommendation or favoring by the Department of Commerce. The Department of Commerce seal and logo, or the seal and logo of a DOC bureau, shall not be used in any manner to imply endorsement of any commercial product or activity by DOC or the United States Government.
