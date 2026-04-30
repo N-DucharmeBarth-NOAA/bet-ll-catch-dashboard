@@ -3,12 +3,15 @@ library(data.table)
 library(ggplot2)
 library(plotly)
 library(DT)
-library(RColorBrewer)
+library(shinyWidgets)
+library(viridisLite)
 
 # ---- Data load & preprocessing -------------------------------------------
-csv_path <- file.path(".","data","WCPFC_L_PUBLIC_BY_YY_FLAG.csv")
+csv_path     <- file.path(".", "data", "WCPFC_L_PUBLIC_BY_YY_FLAG.csv")
+country_path <- file.path(".", "data", "country_codes.csv")
 
-dt <- fread(csv_path)
+dt       <- fread(csv_path)
+ccodes   <- fread(country_path)
 
 # Convert LAT5/LON5 to numeric centroids on a 0-360 longitude convention
 dt[, `:=`(
@@ -27,9 +30,50 @@ dt[flag_code == "US" & lat < 0, flag_code := "AS"]
 # Active flags: only those with at least one non-zero effort or catch record
 active_flags <- sort(unique(dt[HHOOKS > 0 | BET_C > 0 | BET_N > 0, flag_code]))
 
-# Fixed color palette mapped to flag codes (stable across selections)
-flag_pal <- colorRampPalette(RColorBrewer::brewer.pal(12, "Paired"))(length(active_flags))
-names(flag_pal) <- active_flags
+# ---- Flag metadata: full names, custom group, ordering, palette -----------
+# Treat US as DWFN and AS as Territory for plotting purposes,
+# overriding the group1 column from the CSV.
+flag_meta <- ccodes[country_code %in% active_flags,
+                    .(flag_code = country_code, country, group1)]
+
+flag_meta[, plot_group := fcase(
+  flag_code == "US",                              "DWFN",
+  flag_code == "AS",                              "Territory",
+  group1 == "FFA PNA",                            "FFA PNA",
+  group1 == "FFA SPG",                            "FFA SPG",
+  group1 == "FFA Other",                          "FFA Other",
+  flag_code %in% c("JP", "KR", "TW", "CN"),       "DWFN",
+  flag_code %in% c("NC", "PF"),                   "Territory",
+  default = "Other"
+)]
+
+# Group ordering controls stack order in the plot (bottom -> top)
+group_order <- c("FFA PNA", "FFA SPG", "FFA Other", "DWFN", "Territory", "Other")
+flag_meta[, plot_group := factor(plot_group, levels = group_order)]
+setorder(flag_meta, plot_group, country)
+
+# ---- Flag metadata: full names, alphabetical order, rainbow palette -------
+flag_meta <- ccodes[country_code %in% active_flags,
+                    .(flag_code = country_code, country)]
+setorder(flag_meta, flag_code)  # alphabetical by code
+
+flag_levels <- flag_meta$flag_code
+flag_labels <- setNames(sprintf("%s (%s)", flag_meta$country, flag_meta$flag_code),
+                        flag_meta$flag_code)
+flag_choices <- setNames(flag_meta$flag_code, flag_labels)
+
+# Rainbow palette across the alphabetically ordered flags
+mix_with_white <- function(cols, amount = 0.25) {
+  rgb_mat <- col2rgb(cols) / 255
+  white   <- matrix(1, nrow = 3, ncol = ncol(rgb_mat))
+  blended <- rgb_mat * (1 - amount) + white * amount
+  rgb(blended[1, ], blended[2, ], blended[3, ])
+}
+
+flag_pal <- setNames(
+  mix_with_white(viridisLite::turbo(length(flag_levels)), amount = 0.25),
+  flag_levels
+)
 
 # ---- UI ------------------------------------------------------------------
 ui <- fluidPage(
@@ -51,15 +95,13 @@ ui <- fluidPage(
       radioButtons("display_mode", "Display values as:",
                    choices = c("Proportion (%)" = "proportion", "Nominal" = "nominal"),
                    selected = "proportion", inline = TRUE),
-      selectInput("sel_flags", "Flags:",
-                  choices  = active_flags,
-                  selected = active_flags,
-                  multiple = TRUE,
-                  selectize = TRUE),
-      div(
-        style = "margin-bottom: 10px;",
-        actionButton("btn_all",  "Select all",   class = "btn btn-xs btn-default"),
-        actionButton("btn_none", "Deselect all", class = "btn btn-xs btn-default")
+      pickerInput(
+        inputId  = "sel_flags",
+        label    = "Flags:",
+        choices  = flag_choices,
+        selected = flag_levels,
+        multiple = TRUE,
+        options  = list(`actions-box` = TRUE, `live-search` = TRUE)
       ),
       conditionalPanel(
         condition = "input.display_mode === 'proportion'",
@@ -99,7 +141,7 @@ server <- function(input, output, session) {
     d
   })
 
-  # Aggregation over ALL active flags for the current year/lat slice (grand-total denominator)
+  # Aggregation over ALL active flags (grand-total denominator)
   all_flags_agg <- reactive({
     lo <- input$lat_band[1]
     hi <- input$lat_band[2]
@@ -128,7 +170,6 @@ server <- function(input, output, session) {
       BET_N  = sum(BET_N,  na.rm = TRUE)
     ), by = .(lat_band, flag_code)]
 
-    # Ensure every flag × band combination exists (fill absent cells with 0)
     full_grid <- CJ(
       lat_band  = factor(c("Southern LL", "Tropical LL", "Northern LL"),
                          levels = c("Southern LL", "Tropical LL", "Northern LL")),
@@ -158,6 +199,13 @@ server <- function(input, output, session) {
     long[, variable := factor(variable, levels = 1:3,
                               labels = c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"))]
     setnames(long, "variable", "metric")
+
+    # Apply group-based ordering of flags (controls stacking + legend order)
+    long[, flag_code := factor(flag_code, levels = flag_levels)]
+    # Add display label for tooltips / legend
+    long[, flag_label := flag_labels[as.character(flag_code)]]
+    long[, flag_label := factor(flag_label,
+                                levels = flag_labels[flag_levels])]
     long
   })
 
@@ -174,14 +222,6 @@ server <- function(input, output, session) {
       wide[, (val_cols) := lapply(.SD, function(x) x * 100), .SDcols = val_cols]
     }
     as.data.frame(wide)
-  })
-
-  observeEvent(input$btn_all, {
-    updateSelectInput(session, "sel_flags", selected = active_flags)
-  })
-
-  observeEvent(input$btn_none, {
-    updateSelectInput(session, "sel_flags", selected = character(0))
   })
 
   output$plot_caption <- renderUI({
@@ -202,7 +242,7 @@ server <- function(input, output, session) {
     lo_lab <- if (lo < 0) sprintf("%d\u00B0S", abs(lo)) else sprintf("%d\u00B0N", lo)
     hi_lab <- if (hi < 0) sprintf("%d\u00B0S", abs(hi)) else sprintf("%d\u00B0N", hi)
 
-    flag_note <- if (setequal(input$sel_flags, active_flags)) {
+    flag_note <- if (setequal(input$sel_flags, flag_levels)) {
       "All flags"
     } else {
       paste0("flags: ", paste(sort(input$sel_flags), collapse = ", "))
@@ -256,31 +296,35 @@ server <- function(input, output, session) {
     long <- long_data()
     mode <- input$display_mode
 
+    # Named palette using flag labels (so legend shows full names, colors stay correct)
+    pal_named <- setNames(flag_pal[flag_levels],
+                          flag_labels[flag_levels])
+
     if (mode == "proportion") {
       p <- suppressWarnings(
-        ggplot(long, aes(x = lat_band, y = proportion, fill = flag_code)) +
+        ggplot(long, aes(x = lat_band, y = proportion, fill = flag_label)) +
           geom_col(aes(text = paste0(
-            "Flag: ", flag_code,
+            "Flag: ", flag_label,
             "<br>Percent of total: ", sprintf("%.2f%%", proportion * 100)
           ))) +
           facet_wrap(~ metric, ncol = 1) +
           scale_y_continuous(labels = scales::percent_format(accuracy = 1),
                              limits = c(0, 1), expand = c(0, 0)) +
-          scale_fill_manual(values = flag_pal) +
+          scale_fill_manual(values = pal_named, drop = FALSE) +
           labs(x = NULL, y = "Proportion of total", fill = "Flag") +
           theme_bw(base_size = 13) +
           theme(strip.text = element_text(face = "bold"))
       )
     } else {
       p <- suppressWarnings(
-        ggplot(long, aes(x = lat_band, y = raw_value, fill = flag_code)) +
+        ggplot(long, aes(x = lat_band, y = raw_value, fill = flag_label)) +
           geom_col(aes(text = paste0(
-            "Flag: ", flag_code,
+            "Flag: ", flag_label,
             "<br>Value: ", format(round(raw_value), big.mark = ",", scientific = FALSE)
           ))) +
           facet_wrap(~ metric, ncol = 1, scales = "free_y") +
           scale_y_continuous(labels = scales::comma_format(), expand = c(0, 0)) +
-          scale_fill_manual(values = flag_pal) +
+          scale_fill_manual(values = pal_named, drop = FALSE) +
           labs(x = NULL, y = "Value", fill = "Flag") +
           theme_bw(base_size = 13) +
           theme(strip.text = element_text(face = "bold"))
