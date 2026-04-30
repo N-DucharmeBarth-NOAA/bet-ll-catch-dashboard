@@ -2,6 +2,7 @@ library(shiny)
 library(data.table)
 library(ggplot2)
 library(plotly)
+library(DT)
 
 # ---- Data load & preprocessing -------------------------------------------
 csv_path <- file.path(".","data","WCPFC_L_PUBLIC_BY_YY_FLAG.csv")
@@ -19,7 +20,7 @@ dt[, `:=`(
 # Filter out records with empty flag_code
 dt <- dt[flag_code != ""]
 
-# reassign US flag_code south of the equator to AS (American Samoa)
+# Reassign US flag_code south of the equator to AS (American Samoa)
 dt[flag_code == "US" & lat < 0, flag_code := "AS"]
 
 # ---- UI ------------------------------------------------------------------
@@ -42,7 +43,8 @@ ui <- fluidPage(
     ),
     mainPanel(
       uiOutput("plot_caption"),
-      tableOutput("band_summary"),
+      DT::DTOutput("band_summary"),
+      tags$br(),
       plotlyOutput("prop_plot", height = "750px")
     )
   )
@@ -98,6 +100,18 @@ server <- function(input, output, session) {
     long
   })
 
+  # Reactive table data: band totals as percentages, wide format
+  band_table_dat <- reactive({
+    long <- long_data()
+    band_totals <- long[, .(band_total = sum(proportion)), by = .(metric, lat_band)]
+    wide <- dcast(band_totals, metric ~ lat_band, value.var = "band_total", fill = 0)
+    setnames(wide, "metric", "Metric")
+    # Convert proportions to percentages (numeric, formatted by DT)
+    pct_cols <- intersect(c("Southern LL", "Tropical LL", "Northern LL"), names(wide))
+    wide[, (pct_cols) := lapply(.SD, function(x) x * 100), .SDcols = pct_cols]
+    as.data.frame(wide)
+  })
+
   output$plot_caption <- renderUI({
     lo <- input$lat_band[1]; hi <- input$lat_band[2]
     lo_lab <- if (lo < 0) sprintf("%d\u00B0S", abs(lo)) else sprintf("%d\u00B0N", lo)
@@ -109,15 +123,48 @@ server <- function(input, output, session) {
     )
   })
 
-  output$band_summary <- renderTable({    long <- long_data()
-    band_totals <- long[, .(band_total = sum(proportion)), by = .(metric, lat_band)]
-    wide <- dcast(band_totals, metric ~ lat_band, value.var = "band_total")
-    wide[, c("Southern LL", "Tropical LL", "Northern LL") :=
-           lapply(.SD, function(x) sprintf("%.1f%%", x * 100)),
-         .SDcols = c("Southern LL", "Tropical LL", "Northern LL")]
-    setnames(wide, "metric", "Metric")
-    as.data.frame(wide)
-  }, striped = TRUE, bordered = TRUE, hover = TRUE, width = "100%")
+  output$band_summary <- DT::renderDT({
+    dat <- band_table_dat()
+
+    lo <- input$lat_band[1]; hi <- input$lat_band[2]
+    lo_lab <- if (lo < 0) sprintf("%d\u00B0S", abs(lo)) else sprintf("%d\u00B0N", lo)
+    hi_lab <- if (hi < 0) sprintf("%d\u00B0S", abs(hi)) else sprintf("%d\u00B0N", hi)
+
+    cap <- paste0(
+      "Proportion of total by management band (%) \u2014 Years: ",
+      input$year_range[1], "\u2013", input$year_range[2],
+      " | Tropical LL: ", lo_lab, " to ", hi_lab
+    )
+
+    pct_cols <- intersect(c("Southern LL", "Tropical LL", "Northern LL"), names(dat))
+
+    DT::datatable(
+      dat,
+      extensions = "Buttons",
+      caption    = cap,
+      rownames   = FALSE,
+      options    = list(
+        dom        = "Bfrtip",
+        buttons    = list(
+          list(extend = "copy",  text = "Copy",  title = "WCPFC LL band summary"),
+          list(extend = "csv",   text = "CSV",   filename = "wcpfc_ll_band_summary"),
+          list(extend = "excel", text = "Excel", filename = "wcpfc_ll_band_summary",
+               title = "WCPFC LL band summary"),
+          list(extend = "pdf",   text = "PDF",   filename = "wcpfc_ll_band_summary",
+               title = "WCPFC LL band summary",
+               orientation = "landscape")
+        ),
+        paging     = FALSE,
+        searching  = FALSE,
+        info       = FALSE,
+        ordering   = FALSE,
+        scrollX    = TRUE
+      ),
+      class = "stripe hover compact"
+    ) |>
+      DT::formatRound(columns = pct_cols, digits = 1) |>
+      DT::formatStyle(pct_cols, `text-align` = "right")
+  }, server = FALSE)
 
   output$prop_plot <- renderPlotly({
     long <- long_data()
