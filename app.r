@@ -128,6 +128,25 @@ ui <- fluidPage(
                      choices = c("Selected flags only" = "selected",
                                  "All flags (grand total)" = "grand"),
                      selected = "selected")
+      ),
+      tags$hr(),
+      tags$div(
+        tags$p(
+          tags$strong("Source"),
+          style = "margin-bottom: 4px; font-size: 12px;"
+        ),
+        tags$p(
+          "WCPFC public-domain longline aggregated catch and effort data ",
+          "(5\u00B0 \u00D7 5\u00B0 grid, by flag and year, longline, 1950\u20132024, ",
+          "WCPFC Convention Area). ",
+          tags$a(
+            href   = "https://www.wcpfc.int/sustainability/scientific-data/wcpfc-public-domain-aggregated-catcheffort-data-download-page",
+            target = "_blank",
+            "Data download page"
+          ), ".",
+          style = "color: #666; font-size: 11px; line-height: 1.4;"
+        ),
+        style = "margin-top: 12px;"
       )
     ),
     mainPanel(
@@ -362,9 +381,10 @@ server <- function(input, output, session) {
                               sum(HHOOKS, na.rm = TRUE)),
                by = .(YY, lat_band, flag_code, lat, lon)]
 
-    # Unweighted mean across cells, by (year, zone, flag).
+    # Unweighted mean across cells, by (year, zone, flag), and count of cells.
     # No zero-fill: missing combos stay missing -> geom_path shows gaps.
-    agg <- cells[, .(cpue = mean(cell_cpue, na.rm = TRUE)),
+    agg <- cells[, .(cpue    = mean(cell_cpue, na.rm = TRUE),
+                     n_cells = .N),
                  by = .(YY, lat_band, flag_code)]
 
     agg[, flag_code  := factor(flag_code, levels = flag_levels)]
@@ -665,17 +685,27 @@ server <- function(input, output, session) {
   cpue_table_dat <- reactive({
     agg <- cpue_ts_data()
 
-    wide <- dcast(agg, flag_code + YY ~ lat_band, value.var = "cpue")
+    # Long -> wide for both cpue and n_cells, then interleave columns.
+    wide_cpue <- dcast(agg, flag_code + YY ~ lat_band, value.var = "cpue")
+    wide_n    <- dcast(agg, flag_code + YY ~ lat_band, value.var = "n_cells")
 
-    # Ensure all three zone columns exist
-    for (cn in c("Southern LL", "Tropical LL", "Northern LL")) {
-      if (!cn %in% names(wide)) wide[[cn]] <- NA_real_
+    zones <- c("Southern LL", "Tropical LL", "Northern LL")
+    for (cn in zones) {
+      if (!cn %in% names(wide_cpue)) wide_cpue[[cn]] <- NA_real_
+      if (!cn %in% names(wide_n))    wide_n[[cn]]    <- NA_integer_
     }
+
+    # Rename the n_cells columns and merge
+    setnames(wide_n, zones, paste0(zones, " (n)"))
+    wide <- wide_cpue[wide_n, on = .(flag_code, YY)]
 
     wide[, Flag := flag_labels[as.character(flag_code)]]
     wide[, flag_code := NULL]
     setnames(wide, "YY", "Year")
-    setcolorder(wide, c("Flag", "Year", "Southern LL", "Tropical LL", "Northern LL"))
+
+    # Interleave: SLL, SLL (n), TLL, TLL (n), NLL, NLL (n)
+    interleaved <- as.vector(rbind(zones, paste0(zones, " (n)")))
+    setcolorder(wide, c("Flag", "Year", interleaved))
     setorder(wide, Flag, Year)
 
     as.data.frame(wide)
@@ -825,7 +855,9 @@ server <- function(input, output, session) {
                   " | Tropical LL: ", lo_lab, " to ", hi_lab,
                   " | ", flag_note)
 
-    val_cols <- c("Southern LL", "Tropical LL", "Northern LL")
+    cpue_cols <- c("Southern LL", "Tropical LL", "Northern LL")
+    n_cols    <- paste0(cpue_cols, " (n)")
+    val_cols  <- c(cpue_cols, n_cols)
 
     DT::datatable(
       dat,
@@ -851,7 +883,8 @@ server <- function(input, output, session) {
       ),
       class = "stripe hover compact"
     ) |>
-      DT::formatRound(columns = val_cols, digits = 2) |>
+      DT::formatRound(columns = cpue_cols, digits = 2) |>
+      DT::formatRound(columns = n_cols,    digits = 0) |>
       DT::formatStyle(val_cols, `text-align` = "right")
   }, server = FALSE)
 
