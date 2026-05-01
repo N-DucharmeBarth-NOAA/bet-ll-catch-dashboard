@@ -136,6 +136,10 @@ ui <- fluidPage(
         tabPanel("Time-series plot",
           tags$br(),
           plotlyOutput("ts_plot", height = "900px")
+        ),
+        tabPanel("Time-series data",
+          tags$br(),
+          DT::DTOutput("ts_data_table")
         )
       )
     )
@@ -536,6 +540,43 @@ server <- function(input, output, session) {
     as.data.frame(wide)
   })
 
+# ---- Time-series tab: flag x year wide table ----------------------------
+  ts_table_dat <- reactive({
+    long    <- long_ts_data()
+    mode    <- input$display_mode
+    val_col <- if (mode == "proportion") "proportion" else "raw_value"
+
+    d <- long[, .(flag_code, YY, lat_band, metric, value = get(val_col))]
+
+    d[, col_name := paste0(as.character(metric), " | ", as.character(lat_band))]
+
+    col_order <- as.vector(outer(
+      intersect(c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"), input$sel_metrics),
+      c("Southern LL", "Tropical LL", "Northern LL"),
+      FUN = function(m, z) paste0(m, " | ", z)
+    ))
+
+    wide <- dcast(d, flag_code + YY ~ col_name, value.var = "value", fill = 0)
+
+    for (cn in col_order) {
+      if (!cn %in% names(wide)) wide[[cn]] <- 0
+    }
+
+    # Replace flag_code with full label, rename year column
+    wide[, Flag := flag_labels[as.character(flag_code)]]
+    wide[, flag_code := NULL]
+    setnames(wide, "YY", "Year")
+    setcolorder(wide, c("Flag", "Year", intersect(col_order, names(wide))))
+    setorder(wide, Flag, Year)
+
+    val_cols <- intersect(col_order, names(wide))
+    if (mode == "proportion") {
+      wide[, (val_cols) := lapply(.SD, function(x) x * 100), .SDcols = val_cols]
+    }
+
+    as.data.frame(wide)
+  })
+
   output$flag_data_table <- DT::renderDT({
     dat <- flag_table_dat()
 
@@ -580,6 +621,65 @@ server <- function(input, output, session) {
                orientation = "landscape")
         ),
         pageLength = 20,
+        ordering   = TRUE,
+        searching  = TRUE,
+        info       = TRUE,
+        scrollX    = TRUE
+      ),
+      class = "stripe hover compact"
+    ) |>
+      (\(tbl) if (input$display_mode == "nominal")
+        DT::formatCurrency(tbl, columns = val_cols, currency = "", digits = 0)
+      else
+        DT::formatRound(tbl, columns = val_cols, digits = 2)
+      )() |>
+      DT::formatStyle(val_cols, `text-align` = "right")
+  }, server = FALSE)
+
+  output$ts_data_table <- DT::renderDT({
+    dat <- ts_table_dat()
+
+    lo <- input$lat_band[1]; hi <- input$lat_band[2]
+    lo_lab <- if (lo < 0) sprintf("%d\u00B0S", abs(lo)) else sprintf("%d\u00B0N", lo)
+    hi_lab <- if (hi < 0) sprintf("%d\u00B0S", abs(hi)) else sprintf("%d\u00B0N", hi)
+
+    flag_note <- if (setequal(input$sel_flags, flag_levels)) {
+      "All flags"
+    } else {
+      paste0("flags: ", paste(sort(input$sel_flags), collapse = ", "))
+    }
+
+    cap <- if (input$display_mode == "proportion") {
+      paste0("Annual proportion of year total by flag and management band (%) \u2014 Years: ",
+             input$year_range[1], "\u2013", input$year_range[2],
+             " | Tropical LL: ", lo_lab, " to ", hi_lab,
+             " | ", flag_note)
+    } else {
+      paste0("Annual nominal values by flag and management band \u2014 Years: ",
+             input$year_range[1], "\u2013", input$year_range[2],
+             " | Tropical LL: ", lo_lab, " to ", hi_lab,
+             " | ", flag_note)
+    }
+
+    val_cols <- setdiff(names(dat), c("Flag", "Year"))
+
+    DT::datatable(
+      dat,
+      extensions = "Buttons",
+      caption    = cap,
+      rownames   = FALSE,
+      options    = list(
+        dom        = "Bfrtip",
+        buttons    = list(
+          list(extend = "copy",  text = "Copy",  title = "WCPFC LL flag annual data"),
+          list(extend = "csv",   text = "CSV",   filename = "wcpfc_ll_flag_annual_data"),
+          list(extend = "excel", text = "Excel", filename = "wcpfc_ll_flag_annual_data",
+               title = "WCPFC LL flag annual data"),
+          list(extend = "pdf",   text = "PDF",   filename = "wcpfc_ll_flag_annual_data",
+               title = "WCPFC LL flag annual data",
+               orientation = "landscape")
+        ),
+        pageLength = 25,
         ordering   = TRUE,
         searching  = TRUE,
         info       = TRUE,
