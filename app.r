@@ -132,6 +132,10 @@ ui <- fluidPage(
         tabPanel("Summary data",
           tags$br(),
           DT::DTOutput("flag_data_table")
+        ),
+        tabPanel("Time-series plot",
+          tags$br(),
+          plotlyOutput("ts_plot", height = "900px")
         )
       )
     )
@@ -229,6 +233,90 @@ server <- function(input, output, session) {
     long[, flag_label := flag_labels[as.character(flag_code)]]
     long[, flag_label := factor(flag_label,
                                 levels = flag_labels[flag_levels])]
+    long
+  })
+
+  # ---- Time-series reactive: year x zone x flag, per-year denominators ----
+  long_ts_data <- reactive({
+    validate(need(length(input$sel_flags) > 0,
+                  "No flags selected \u2014 use the Flags selector to include at least one flag."))
+    validate(need(length(input$sel_metrics) > 0,
+                  "No data selected \u2014 use the Data to show selector to include at least one metric."))
+    d <- filtered()
+    validate(need(nrow(d) > 0, "No data in selected year range."))
+
+    # Aggregate selected flags by year x zone x flag
+    agg <- d[, .(
+      HHOOKS = sum(HHOOKS, na.rm = TRUE),
+      BET_C  = sum(BET_C,  na.rm = TRUE),
+      BET_N  = sum(BET_N,  na.rm = TRUE)
+    ), by = .(YY, lat_band, flag_code)]
+
+    # Full grid: every year x zone x selected flag, so geom_path / geom_area
+    # see continuous (zero-filled) series rather than gaps.
+    yrs <- seq.int(input$year_range[1], input$year_range[2])
+    full_grid <- CJ(
+      YY        = yrs,
+      lat_band  = factor(c("Southern LL", "Tropical LL", "Northern LL"),
+                         levels = c("Southern LL", "Tropical LL", "Northern LL")),
+      flag_code = input$sel_flags
+    )
+    agg <- agg[full_grid, on = .(YY, lat_band, flag_code)]
+    agg[is.na(HHOOKS), `:=`(HHOOKS = 0L, BET_C = 0, BET_N = 0)]
+
+    # Per-year-per-zone denominator. "selected" sums over selected flags;
+    # "grand" sums over all active flags (so selected stacks may sum to <100%).
+    if (isTRUE(input$prop_basis == "grand")) {
+      lo <- input$lat_band[1]; hi <- input$lat_band[2]
+      grand <- dt[YY >= input$year_range[1] & YY <= input$year_range[2] &
+                    flag_code %in% active_flags]
+      grand[, lat_band := fcase(
+        lat <  lo,             "Southern LL",
+        lat >= lo & lat <= hi, "Tropical LL",
+        lat >  hi,             "Northern LL"
+      )]
+      grand[, lat_band := factor(lat_band,
+                                 levels = c("Southern LL", "Tropical LL", "Northern LL"))]
+      denom <- grand[, .(
+        tot_HHOOKS = sum(HHOOKS, na.rm = TRUE),
+        tot_BET_C  = sum(BET_C,  na.rm = TRUE),
+        tot_BET_N  = sum(BET_N,  na.rm = TRUE)
+      ), by = .(YY, lat_band)]
+    } else {
+      denom <- agg[, .(
+        tot_HHOOKS = sum(HHOOKS, na.rm = TRUE),
+        tot_BET_C  = sum(BET_C,  na.rm = TRUE),
+        tot_BET_N  = sum(BET_N,  na.rm = TRUE)
+      ), by = .(YY, lat_band)]
+    }
+
+    agg <- denom[agg, on = .(YY, lat_band)]
+    agg[, `:=`(
+      p_HHOOKS = fifelse(tot_HHOOKS > 0, HHOOKS / tot_HHOOKS, 0),
+      p_BET_C  = fifelse(tot_BET_C  > 0, BET_C  / tot_BET_C,  0),
+      p_BET_N  = fifelse(tot_BET_N  > 0, BET_N  / tot_BET_N,  0),
+      HHOOKS   = as.double(HHOOKS),
+      BET_C    = as.double(BET_C),
+      BET_N    = as.double(BET_N)
+    )]
+    agg[, c("tot_HHOOKS", "tot_BET_C", "tot_BET_N") := NULL]
+
+    long <- melt(agg,
+                 id.vars      = c("YY", "lat_band", "flag_code"),
+                 measure.vars = list(
+                   proportion = c("p_HHOOKS", "p_BET_C", "p_BET_N"),
+                   raw_value  = c("HHOOKS",   "BET_C",   "BET_N")
+                 ))
+
+    long[, variable := factor(variable, levels = 1:3,
+                              labels = c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"))]
+    setnames(long, "variable", "metric")
+
+    long <- long[as.character(metric) %in% input$sel_metrics]
+
+    long[, flag_code  := factor(flag_code, levels = flag_levels)]
+    long[, flag_label := flag_labels[as.character(flag_code)]]
+    long[, flag_label := factor(flag_label, levels = flag_labels[flag_levels])]
     long
   })
 
@@ -356,6 +444,57 @@ server <- function(input, output, session) {
 
     ggplotly(p, tooltip = "text")
   })
+
+  # ---- Time-series plot ---------------------------------------------------
+  output$ts_plot <- renderPlotly({
+    long <- long_ts_data()
+    mode <- input$display_mode
+
+    pal_named <- setNames(flag_pal[flag_levels], flag_labels[flag_levels])
+
+    if (mode == "proportion") {
+      p <- suppressWarnings(
+        ggplot(long, aes(x = YY, y = proportion,
+                         fill = flag_label, group = flag_label)) +
+          geom_col(aes(text = paste0(
+            "Year: ", YY,
+            "<br>Flag: ", flag_label,
+            "<br>Percent of year: ", sprintf("%.2f%%", proportion * 100)
+          )), position = "stack", width = 1) +
+          facet_grid(metric ~ lat_band, scales = "fixed") +
+          scale_x_continuous(expand = c(0, 0)) +
+          scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                             expand = c(0, 0)) +
+          scale_fill_manual(values = pal_named, drop = FALSE) +
+          labs(x = NULL, y = "Proportion of year total", fill = "Flag") +
+          theme_bw(base_size = 13) +
+          theme(strip.text      = element_text(face = "bold"),
+                legend.position = "bottom")
+      )
+    } else {
+      p <- suppressWarnings(
+        ggplot(long, aes(x = YY, y = raw_value,
+                         colour = flag_label, group = flag_label)) +
+          geom_path(aes(text = paste0(
+            "Year: ", YY,
+            "<br>Flag: ", flag_label,
+            "<br>Value: ", format(round(raw_value), big.mark = ",", scientific = FALSE)
+          ))) +
+          facet_grid(metric ~ lat_band, scales = "free_y") +
+          scale_x_continuous(expand = c(0, 0)) +
+          scale_y_continuous(labels = scales::comma_format()) +
+          scale_colour_manual(values = pal_named, drop = FALSE) +
+          labs(x = NULL, y = "Value", colour = "Flag") +
+          theme_bw(base_size = 13) +
+          theme(strip.text      = element_text(face = "bold"),
+                legend.position = "bottom")
+      )
+    }
+
+    ggplotly(p, tooltip = "text") |>
+      plotly::layout(legend = list(orientation = "h", y = -0.15))
+  })
+
   # ---- Data tab: flag-level wide table ------------------------------------
   flag_table_dat <- reactive({
     long    <- long_data()
@@ -368,7 +507,7 @@ server <- function(input, output, session) {
     # Build combined column name: "metric | zone"
     d[, col_name := paste0(as.character(metric), " | ", as.character(lat_band))]
 
-    # Dcast: one row per flag, columns = metric × zone combos
+    # Dcast: one row per flag, columns = metric x zone combos
     col_order <- as.vector(outer(
       intersect(c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"), input$sel_metrics),
       c("Southern LL", "Tropical LL", "Northern LL"),
