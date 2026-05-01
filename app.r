@@ -93,16 +93,26 @@ ui <- fluidPage(
                   step = 5),
       helpText("Defines the latitude bounds of the Tropical LL band. ",
               "Southern LL is south of the lower bound; Northern LL is north of the upper bound."),
-      radioButtons("display_mode", "Display values as:",
-                   choices = c("Proportion (%)" = "proportion", "Nominal" = "nominal"),
-                   selected = "proportion", inline = TRUE),
-      pickerInput(
-        inputId  = "sel_metrics",
-        label    = "Data to show:",
-        choices  = c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"),
-        selected = c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"),
-        multiple = TRUE,
-        options  = list(`actions-box` = TRUE)
+      conditionalPanel(
+        condition = "input.main_tabs !== 'CPUE plot' && input.main_tabs !== 'CPUE data'",
+        radioButtons("display_mode", "Display values as:",
+                     choices = c("Proportion (%)" = "proportion", "Nominal" = "nominal"),
+                     selected = "proportion", inline = TRUE),
+        pickerInput(
+          inputId  = "sel_metrics",
+          label    = "Data to show:",
+          choices  = c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"),
+          selected = c("Effort (hooks)", "Catch (mt)", "Catch (numbers)"),
+          multiple = TRUE,
+          options  = list(`actions-box` = TRUE)
+        )
+      ),
+      conditionalPanel(
+        condition = "input.main_tabs === 'CPUE plot' || input.main_tabs === 'CPUE data'",
+        radioButtons("cpue_numerator", "CPUE numerator:",
+                     choices = c("Weight (kg / 100 hooks)"    = "weight",
+                                 "Numbers (fish / 100 hooks)" = "numbers"),
+                     selected = "weight", inline = FALSE)
       ),
       pickerInput(
         inputId  = "sel_flags",
@@ -113,7 +123,7 @@ ui <- fluidPage(
         options  = list(`actions-box` = TRUE, `live-search` = TRUE)
       ),
       conditionalPanel(
-        condition = "input.display_mode === 'proportion'",
+        condition = "input.display_mode === 'proportion' && input.main_tabs !== 'CPUE plot' && input.main_tabs !== 'CPUE data'",
         radioButtons("prop_basis", "Proportion relative to:",
                      choices = c("Selected flags only" = "selected",
                                  "All flags (grand total)" = "grand"),
@@ -122,6 +132,7 @@ ui <- fluidPage(
     ),
     mainPanel(
       tabsetPanel(
+        id = "main_tabs",
         tabPanel("Summary plot",
           tags$br(),
           uiOutput("plot_caption"),
@@ -140,6 +151,14 @@ ui <- fluidPage(
         tabPanel("Time-series data",
           tags$br(),
           DT::DTOutput("ts_data_table")
+        ),
+        tabPanel("CPUE plot",
+          tags$br(),
+          plotlyOutput("cpue_plot", height = "500px")
+        ),
+        tabPanel("CPUE data",
+          tags$br(),
+          DT::DTOutput("cpue_data_table")
         )
       )
     )
@@ -324,6 +343,36 @@ server <- function(input, output, session) {
     long
   })
 
+  # ---- CPUE: cell-level CPUE, then unweighted mean across cells -----------
+  cpue_ts_data <- reactive({
+    validate(need(length(input$sel_flags) > 0,
+                  "No flags selected \u2014 use the Flags selector to include at least one flag."))
+    d <- filtered()
+    validate(need(nrow(d) > 0, "No data in selected year range."))
+
+    # Numerator: BET_C (mt) -> kg, or BET_N (numbers)
+    num_col   <- if (isTRUE(input$cpue_numerator == "numbers")) "BET_N" else "BET_C"
+    num_scale <- if (isTRUE(input$cpue_numerator == "numbers")) 1 else 1000  # mt -> kg
+
+    # Cell-level: one CPUE per (year, zone, flag, lat-cell, lon-cell).
+    # HHOOKS is hundred-hooks, so cell_cpue is already "per 100 hooks".
+    # Multiply weight numerator by 1000 to give kg / 100 hooks.
+    cells <- d[HHOOKS > 0,
+               .(cell_cpue = (sum(get(num_col), na.rm = TRUE) * num_scale) /
+                              sum(HHOOKS, na.rm = TRUE)),
+               by = .(YY, lat_band, flag_code, lat, lon)]
+
+    # Unweighted mean across cells, by (year, zone, flag).
+    # No zero-fill: missing combos stay missing -> geom_path shows gaps.
+    agg <- cells[, .(cpue = mean(cell_cpue, na.rm = TRUE)),
+                 by = .(YY, lat_band, flag_code)]
+
+    agg[, flag_code  := factor(flag_code, levels = flag_levels)]
+    agg[, flag_label := flag_labels[as.character(flag_code)]]
+    agg[, flag_label := factor(flag_label, levels = flag_labels[flag_levels])]
+    agg
+  })
+
   # Reactive table data: band totals, wide format
   band_table_dat <- reactive({
     long    <- long_data()
@@ -499,6 +548,41 @@ server <- function(input, output, session) {
       plotly::layout(legend = list(orientation = "h", y = -0.15))
   })
 
+  # ---- CPUE plot ----------------------------------------------------------
+  output$cpue_plot <- renderPlotly({
+    agg <- cpue_ts_data()
+    validate(need(nrow(agg) > 0, "No CPUE data for the current selection."))
+
+    pal_named <- setNames(flag_pal[flag_levels], flag_labels[flag_levels])
+
+    y_lab <- if (isTRUE(input$cpue_numerator == "numbers")) {
+      "CPUE (fish / 100 hooks)"
+    } else {
+      "CPUE (kg / 100 hooks)"
+    }
+
+    p <- suppressWarnings(
+      ggplot(agg, aes(x = YY, y = cpue,
+                      colour = flag_label, group = flag_label)) +
+        geom_path(aes(text = paste0(
+          "Year: ", YY,
+          "<br>Flag: ", flag_label,
+          "<br>CPUE: ", format(round(cpue, 2), big.mark = ",", scientific = FALSE)
+        ))) +
+        facet_grid(. ~ lat_band, scales = "fixed") +
+        scale_x_continuous(expand = c(0, 0)) +
+        scale_y_continuous(labels = scales::comma_format()) +
+        scale_colour_manual(values = pal_named, drop = FALSE) +
+        labs(x = NULL, y = y_lab, colour = "Flag") +
+        theme_bw(base_size = 13) +
+        theme(strip.text      = element_text(face = "bold"),
+              legend.position = "bottom")
+    )
+
+    ggplotly(p, tooltip = "text") |>
+      plotly::layout(legend = list(orientation = "h", y = -0.25))
+  })
+
   # ---- Data tab: flag-level wide table ------------------------------------
   flag_table_dat <- reactive({
     long    <- long_data()
@@ -540,7 +624,7 @@ server <- function(input, output, session) {
     as.data.frame(wide)
   })
 
-# ---- Time-series tab: flag x year wide table ----------------------------
+  # ---- Time-series tab: flag x year wide table ----------------------------
   ts_table_dat <- reactive({
     long    <- long_ts_data()
     mode    <- input$display_mode
@@ -573,6 +657,26 @@ server <- function(input, output, session) {
     if (mode == "proportion") {
       wide[, (val_cols) := lapply(.SD, function(x) x * 100), .SDcols = val_cols]
     }
+
+    as.data.frame(wide)
+  })
+
+  # ---- CPUE tab: flag x year wide table -----------------------------------
+  cpue_table_dat <- reactive({
+    agg <- cpue_ts_data()
+
+    wide <- dcast(agg, flag_code + YY ~ lat_band, value.var = "cpue")
+
+    # Ensure all three zone columns exist
+    for (cn in c("Southern LL", "Tropical LL", "Northern LL")) {
+      if (!cn %in% names(wide)) wide[[cn]] <- NA_real_
+    }
+
+    wide[, Flag := flag_labels[as.character(flag_code)]]
+    wide[, flag_code := NULL]
+    setnames(wide, "YY", "Year")
+    setcolorder(wide, c("Flag", "Year", "Southern LL", "Tropical LL", "Northern LL"))
+    setorder(wide, Flag, Year)
 
     as.data.frame(wide)
   })
@@ -692,6 +796,62 @@ server <- function(input, output, session) {
       else
         DT::formatRound(tbl, columns = val_cols, digits = 2)
       )() |>
+      DT::formatStyle(val_cols, `text-align` = "right")
+  }, server = FALSE)
+
+  output$cpue_data_table <- DT::renderDT({
+    dat <- cpue_table_dat()
+    validate(need(nrow(dat) > 0, "No CPUE data for the current selection."))
+
+    lo <- input$lat_band[1]; hi <- input$lat_band[2]
+    lo_lab <- if (lo < 0) sprintf("%d\u00B0S", abs(lo)) else sprintf("%d\u00B0N", lo)
+    hi_lab <- if (hi < 0) sprintf("%d\u00B0S", abs(hi)) else sprintf("%d\u00B0N", hi)
+
+    flag_note <- if (setequal(input$sel_flags, flag_levels)) {
+      "All flags"
+    } else {
+      paste0("flags: ", paste(sort(input$sel_flags), collapse = ", "))
+    }
+
+    units_lab <- if (isTRUE(input$cpue_numerator == "numbers")) {
+      "fish / 100 hooks"
+    } else {
+      "kg / 100 hooks"
+    }
+
+    cap <- paste0("Annual CPUE (", units_lab,
+                  ") by flag and management band \u2014 mean of cell-level CPUEs \u2014 Years: ",
+                  input$year_range[1], "\u2013", input$year_range[2],
+                  " | Tropical LL: ", lo_lab, " to ", hi_lab,
+                  " | ", flag_note)
+
+    val_cols <- c("Southern LL", "Tropical LL", "Northern LL")
+
+    DT::datatable(
+      dat,
+      extensions = "Buttons",
+      caption    = cap,
+      rownames   = FALSE,
+      options    = list(
+        dom        = "Bfrtip",
+        buttons    = list(
+          list(extend = "copy",  text = "Copy",  title = "WCPFC LL CPUE"),
+          list(extend = "csv",   text = "CSV",   filename = "wcpfc_ll_cpue"),
+          list(extend = "excel", text = "Excel", filename = "wcpfc_ll_cpue",
+               title = "WCPFC LL CPUE"),
+          list(extend = "pdf",   text = "PDF",   filename = "wcpfc_ll_cpue",
+               title = "WCPFC LL CPUE",
+               orientation = "landscape")
+        ),
+        pageLength = 25,
+        ordering   = TRUE,
+        searching  = TRUE,
+        info       = TRUE,
+        scrollX    = TRUE
+      ),
+      class = "stripe hover compact"
+    ) |>
+      DT::formatRound(columns = val_cols, digits = 2) |>
       DT::formatStyle(val_cols, `text-align` = "right")
   }, server = FALSE)
 
